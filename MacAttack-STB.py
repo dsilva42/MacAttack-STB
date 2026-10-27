@@ -2375,6 +2375,7 @@ class MacAttackApp(tk.Tk):
                                 fc["category_type"],
                                 fc.get("category_id") or fc.get("genre_id"))
                             total_channels += cnt * len(cats[grp])
+                            break
                     
                     expire_date = get_expire_date(getattr(session, "expire_profile", None))
                     expire_str = expire_date if expire_date else "N/A (portal does not publish it)"
@@ -2386,6 +2387,34 @@ class MacAttackApp(tk.Tk):
                         pr_reason = pr
                     except Exception:
                         pass
+                    
+                    # A successful test is a real hit: record it once so the
+                    # HITS counter and the exports agree with the output log.
+                    test_proxy = proxies["http"].replace("http://", "") if proxies else "Direct Connection"
+                    already = any(
+                        h.get("mac") == mac and h.get("portal") == base_url
+                        for h in self.found_macs_list
+                    )
+                    if not already:
+                        self.found_macs_list.append({
+                            "portal": base_url,
+                            "mac": mac,
+                            "proxy": test_proxy,
+                            "found_on": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "channels": total_channels,
+                            "expire_date": expire_str,
+                            "playable": playable,
+                            "playable_reason": pr_reason,
+                            "categories": {
+                                "live": len(cats.get("Live", [])),
+                                "movies": len(cats.get("Movies", [])),
+                                "series": len(cats.get("Series", []))
+                            }
+                        })
+                        self.hits_count += 1
+                        self.stats["hits"] += 1
+                        hits_n = self.hits_count
+                        self.after(0, lambda: self.hits_label_var.set(f"HITS: {hits_n}"))
                     
                     msg = (
                         f"✅ Success! MAC {mac} is valid!\n"
