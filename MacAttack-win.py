@@ -2332,17 +2332,17 @@ class MacAttackApp(tk.Tk):
 
         self.running_attack = True
         self.paused_attack = False
-        self.hits_count = 0
+        # HITS and the found list are cumulative across scans; only per-scan
+        # progress counters reset here.
         self.tested_macs.clear()
-        self.found_macs_list = []
         self.stats = {
             "total_tested": 0,
-            "hits": 0,
+            "hits": self.hits_count,
             "errors": 0,
             "start_time": time.time(),
         }
         
-        self.hits_label_var.set("HITS: 0")
+        self.hits_label_var.set(f"HITS: {self.hits_count}")
         self.status_var.set("Status: Running")
         
         self.start_btn.config(state="disabled")
